@@ -35,3 +35,6 @@ a { color: var(--accent); }
   padding: 14px 16px;
 }
 hr { border: 0; border-top: 1px solid var(--card); margin: 3rem 0; }
+.brand { display: flex; align-items: center; gap: 16px; margin: 8px 0 4px; }
+.brand img { width: 96px; height: 96px; flex: none; }
+.brand h1 { margin: 0; }
