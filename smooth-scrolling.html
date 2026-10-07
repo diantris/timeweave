@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>From Stutter to Smooth – Timeweave</title>
+<meta name="description" content="How Timeweave's endless calendar went from visible stutter to smooth scrolling on a 90 Hz phone: what was measured, what was found and what fixed it.">
+<link rel="stylesheet" href="style.css">
+<style>
+  table { border-collapse: collapse; width: 100%; margin: 0.75rem 0 1rem; font-size: 0.95rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--card); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  pre { background: var(--card); border-radius: 12px; padding: 12px 14px; overflow-x: auto; font-size: 0.85rem; line-height: 1.45; }
+  code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 0.9em; }
+  p code, li code, td code { background: var(--card); border-radius: 6px; padding: 1px 5px; }
+  .lesson { border-left: 4px solid var(--accent); padding: 2px 0 2px 14px; margin: 1rem 0; }
+  .table-wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+<p class="lang"><a href="./">Timeweave</a></p>
+
+<h1>From stutter to smooth</h1>
+<p class="meta">How Timeweave's calendar learned to scroll at 90 Hz · October 2026</p>
+
+<p class="summary"><strong>In short:</strong> the calendar stuttered when flicking through it. Guessing fixed a little. Measuring found two real causes: one button that rebuilt the whole screen, and day tiles so heavy that Dart's memory clean-up paused the scroll for up to 78 ms. Both are fixed; the long pauses are gone.</p>
+
+<h2>The setup</h2>
+<p>Timeweave is a Flutter app for Android. Its main screen is an endless vertical stream of small day tiles, four per row, each showing the weekday, the date, four dots for how busy the day is and sometimes a "!" badge. About 40 tiles are on screen at once.</p>
+<p>The test phone was a Pixel 7. Its screen refreshes 90 times a second, so every frame has to be ready within <strong>11.1 ms</strong> (a 60 Hz screen allows 16.7 ms). A frame that misses that window is shown one refresh late, and a few in a row are a visible hitch.</p>
+
+<h2>Round 1: fixing the usual suspects</h2>
+<p>Before measuring anything, a read through the code turned up four likely costs, and all four were fixed:</p>
+<ul>
+<li><strong>Date formatters built for every tile.</strong> Each tile created two new <code>DateFormat</code> objects every time it was built, and each one parses its pattern again. They are now created once and reused.</li>
+<li><strong>A rounded clip on every tile.</strong> Clipping 40 tiles is extra drawing work every frame; the tiles now draw a rounded background instead.</li>
+<li><strong>Days loaded again when scrolling back.</strong> Tasks are loaded in 4-week blocks, and a block was dropped the moment its tiles left the screen. Blocks now stay loaded for a minute.</li>
+<li><strong>Days loaded only once visible.</strong> The list now prepares about one screen ahead, so a tile's tasks are usually there before it appears.</li>
+</ul>
+<p>Result: "better, but you can still see it". Sensible fixes, but none of them was <em>the</em> problem.</p>
+<p class="lesson">Lesson: reading code finds plausible costs, not necessarily the real ones. Measure before fixing.</p>
+
+<h2>Round 2: measuring frames, finding a 29 ms frame</h2>
+<p>The next step was an automated scroll test running on the phone itself in <em>profile</em> mode (almost release speed, but with timing data), using Flutter's <code>integration_test</code> package and <code>flutter drive</code>. It fills its own throwaway database with three years of tasks, scrolls fast and slow, and records every frame.</p>
+<p>Getting reliable numbers took a few tries, each worth knowing:</p>
+<ul>
+<li>The timeline recorder couldn't connect to the app until the run used <code>--no-dds</code>.</li>
+<li>The first runs captured only about 20 frames. Profile builds keep the trace in a small ring buffer, and recording <em>everything</em> (compiler, VM internals) overwrote the scroll within a second or two. Recording only the <code>Dart</code>, <code>Embedder</code> and <code>GC</code> streams fixed it. An "endless" buffer was not the answer: it made pulling the trace off the phone hang.</li>
+<li>The test framework moves time in jumps by default. <code>LiveTestWidgetsFlutterBindingFramePolicy.fullyLive</code> makes it draw frames at the phone's own pace.</li>
+<li>Simulated finger flings barely moved the list in that mode, so the test scrolls with <code>ScrollPosition.animateTo</code> over fixed distances instead.</li>
+<li>The test turns on accessibility (semantics) by itself, which costs about 5 ms per frame. Phones without TalkBack or similar don't pay that, so it has to be subtracted when judging frames.</li>
+</ul>
+<p>With that, one frame stood out at <strong>29 ms</strong>. Turning on per-widget build events (<code>debugProfileBuildsEnabledUserWidgets</code>) showed the whole screen being rebuilt in it: the app bar, the scroll view and every visible tile.</p>
+<p>The trigger was the floating <strong>"Today"</strong> button. It appears once today's card scrolls out of view, and it was part of the screen's state, so showing it ran <code>setState</code> on the entire screen, right in the middle of a scroll. The same happened when it disappeared again.</p>
+<pre><code>// Before: showing the button rebuilt everything.
+if (hidden != _showTodayButton) setState(() =&gt; _showTodayButton = hidden);
+
+// After: only the button listens.
+final _showTodayButton = ValueNotifier(false);
+...
+floatingActionButton: ValueListenableBuilder(
+  valueListenable: _showTodayButton,
+  builder: (context, show, _) =&gt; show ? FloatingActionButton.extended(...)
+                                       : const SizedBox.shrink(),
+),</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Scripted scroll test</th><th class="num">Before</th><th class="num">After</th></tr>
+<tr><td>Worst frame (without test-only semantics)</td><td class="num">29.1 ms</td><td class="num">9.5 ms</td></tr>
+<tr><td>Frames over the 11.1 ms budget</td><td class="num">1 big one, every time</td><td class="num">0</td></tr>
+</table></div>
+<p class="lesson">Lesson: anything that changes <em>during</em> a scroll must not rebuild the whole screen. Give it its own small listener.</p>
+
+<h2>Round 3: real fingers, real app</h2>
+<p>The scripted test was now perfect, yet a fast flick by hand still looked a bit jerky. Two things were different from the test: real touch input, and the real app instead of a test harness.</p>
+<p>Real swipes can be sent over USB with <code>adb shell input swipe</code>. Inside the test this needed <code>binding.shouldPropagateDevicePointerEvents = true</code>, otherwise the framework ignores real touches. Even better, Android's own display system records when each frame of the <em>real release app</em> reached the screen, with no test code involved:</p>
+<pre><code>adb shell dumpsys SurfaceFlinger --latency-clear
+adb shell input swipe 540 1900 540 700 90
+adb shell dumpsys SurfaceFlinger --latency '&lt;the app's SurfaceView layer&gt;'</code></pre>
+<p>The gaps between those present times told the real story: mostly 11.1 ms, but regularly 22 ms (one refresh skipped), and once or twice per flick <strong>44–78 ms</strong>, which is four to seven frames missing. That's the visible stutter.</p>
+<p>A quick round of experiments narrowed it down, building the app with parts of the tile switched off:</p>
+<div class="table-wrap"><table>
+<tr><th>Tile version</th><th class="num">Single skips</th><th class="num">Long pauses</th></tr>
+<tr><td>Normal</td><td class="num">28–35</td><td class="num">3–9</td></tr>
+<tr><td>Without the four dots</td><td class="num">28</td><td class="num">2</td></tr>
+<tr><td>Without the rounded tappable background</td><td class="num">31</td><td class="num">4</td></tr>
+<tr><td>Without text</td><td class="num">~12</td><td class="num">~2</td></tr>
+<tr><td>A plain coloured box</td><td class="num">2</td><td class="num">0</td></tr>
+</table></div>
+<p>So it was the tiles, but no single part of them. Two more things were ruled out along the way: flicking only in the middle of the list (never touching the top) still showed the pauses, so Android's overscroll "stretch" wasn't the cause; and the numbers vary quite a bit from run to run, so it takes several flicks per version to compare fairly.</p>
+<p class="lesson">Lesson: a test harness is not the app. Measure the real build with real input too.</p>
+
+<h2>Round 4: catching the memory clean-up in the act</h2>
+<p>To see <em>what</em> happened inside those pauses, the real app was traced with Android's built-in <strong>Perfetto</strong> system tracer. A profile build started with an extra flag sends Flutter's own events (build, layout, garbage collection) into the system trace:</p>
+<pre><code>adb shell am start -W -n &lt;app&gt;/.MainActivity --ez trace-systrace true
+adb shell "cat config.txt | perfetto --txt -c - -o /data/misc/perfetto-traces/flick.pftrace"</code></pre>
+<p>Read with Perfetto's trace processor, the picture was clear. Every long frame contained a <strong>Scavenge</strong>, Dart's quick clean-up of recently created objects, taking <strong>28–56 ms</strong>. During it, the main thread mostly <em>slept</em>, waiting for a helper thread that was busy copying objects on one of the phone's fast cores the whole time. A scavenge normally takes a millisecond or two.</p>
+<p>Why so slow? A scavenge copies every recently created object that is still in use. During a fast flick, those are all the new day tiles, and each tile was built from about <strong>60 widgets</strong>, each with its element and often a render object. Material's ripple machinery (<code>Material</code> + <code>InkWell</code>) alone contributed about 25 of them, and the four dots (four boxes in a row, with padding) about 15. That's also why the plain coloured box had no pauses at all.</p>
+<p>The fix was to build each tile from far fewer pieces while keeping its look:</p>
+<ul>
+<li><strong>The four dots are one <code>CustomPaint</code></strong> instead of four decorated boxes. They look identical, and the Today card and day view benefit too.</li>
+<li><strong>A <code>DecoratedBox</code> with a <code>GestureDetector</code></strong> instead of <code>Material</code> + <code>InkWell</code>. The only visible difference is that tapping a tile shows no ripple; it still opens the day straight away, and screen readers still see a button.</li>
+<li><strong>The badge layer (<code>Stack</code>) is only added</strong> on days that actually have a "!" or "?".</li>
+</ul>
+<div class="table-wrap"><table>
+<tr><th>Real app, real flicks (per 6 flicks)</th><th class="num">Before</th><th class="num">After</th></tr>
+<tr><td>Long pauses (33 ms or more)</td><td class="num">3–9</td><td class="num">0.5</td></tr>
+<tr><td>Worst pause</td><td class="num">67–78 ms</td><td class="num">33 ms</td></tr>
+<tr><td>Single skipped frames</td><td class="num">28–35</td><td class="num">~22</td></tr>
+</table></div>
+<p class="lesson">Lesson: in a list that builds many items quickly, the number of widgets per item matters. Not because building them is slow, but because they all have to survive the next garbage collection.</p>
+
+<h2>What's left</h2>
+<p>An occasional single skipped frame at 90 Hz, which is very hard to notice. With an accessibility service such as TalkBack switched on, the calendar does about 5 ms more work per frame and a few frames still go slightly over budget; that's on the list for later, because the app is meant to be accessible.</p>
+
+<h2>Takeaways</h2>
+<ol>
+<li>Know your frame budget: 11.1 ms at 90 Hz, not 16.7 ms.</li>
+<li>Measure before fixing. The two real causes were not on the first list of suspects.</li>
+<li>Separate building (your code) from drawing (the GPU). Here, drawing was always fine.</li>
+<li>Look between frames too. The worst pauses came from garbage collection, which per-frame build times didn't show.</li>
+<li>Check the real app with real input. <code>dumpsys SurfaceFlinger --latency</code> needs no test code at all.</li>
+<li>Keep list items light. Fewer widgets per item means less for the garbage collector to copy.</li>
+<li>Never rebuild a whole screen for a small change during a scroll.</li>
+</ol>
+
+<p class="meta">Timeweave is built with Flutter. Measurements were taken on a Pixel 7 in October 2026. Investigated and written with the help of Claude (Anthropic).</p>
+</main>
+</body>
+</html>
